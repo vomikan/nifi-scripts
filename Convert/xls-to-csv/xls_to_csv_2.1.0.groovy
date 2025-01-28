@@ -2,6 +2,7 @@
 @Grab(group='org.apache.poi', module='poi-ooxml-schemas', version='4.1.2')
 @Grab(group='org.apache.xmlbeans', module='xmlbeans', version='3.1.0')
 @Grab(group='commons-io', module='commons-io', version='2.8.0')
+@Grab(group='com.opencsv', module='opencsv', version='5.5.2') // Add OpenCSV dependency
 
 import org.apache.poi.ss.usermodel.*
 import org.apache.poi.xssf.usermodel.XSSFWorkbook
@@ -10,6 +11,7 @@ import java.io.*
 import java.text.SimpleDateFormat
 import org.apache.commons.io.IOUtils
 import java.nio.charset.StandardCharsets
+import com.opencsv.CSVWriter // Import CSVWriter
 
 flowFile = session.get()
 if (!flowFile) return
@@ -17,12 +19,11 @@ if (!flowFile) return
 newFlowFile = session.create()
 def filename = flowFile.getAttribute('filename')
 newFlowFile = session.putAttribute(newFlowFile, "filename", filename)
-
 // Устанавливаем mimetype для CSV
 newFlowFile = session.putAttribute(newFlowFile, "mime.type", "text/csv")
 
-flowFile.getAttributes().each { key, value -> 
-    session.putAttribute(newFlowFile, key, value) 
+flowFile.getAttributes().each { key, value ->
+    session.putAttribute(newFlowFile, key, value)
 }
 
 try {
@@ -33,14 +34,12 @@ try {
 
     def sheet = wb.getSheetAt(0) // Используем первый лист
     int lastRow = sheet.getLastRowNum()
-    def csv_data_rows = []
     def non_empty_columns = []
 
     // Находим непустые столбцы
     for (def i = 0; i <= lastRow; i++) {
         def row = sheet.getRow(i)
         if (row == null) continue
-
         int lastColumn = row.getLastCellNum()
         for (def j = 0; j < lastColumn; j++) {
             Cell cell = row.getCell(j)
@@ -52,44 +51,58 @@ try {
         }
     }
 
-    // Обрабатываем строки
-    for (def i = 0; i <= lastRow; i++) {
-        def row = sheet.getRow(i)
-        if (row == null) continue
+    // Записываем данные в новый FlowFile с использованием CSVWriter
+    newFlowFile = session.write(newFlowFile, { outputStream ->
+        OutputStreamWriter outputStreamWriter = new OutputStreamWriter(outputStream, StandardCharsets.UTF_8)
+        // Создаем CSVWriter с настройками
+        def csvWriter = new CSVWriter(outputStreamWriter,
+            CSVWriter.DEFAULT_SEPARATOR,      // разделитель (запятая)
+            CSVWriter.NO_QUOTE_CHARACTER,     // символ кавычки (отключен)
+            CSVWriter.DEFAULT_ESCAPE_CHARACTER, // символ экранирования
+            CSVWriter.DEFAULT_LINE_END        // конец строки
+        )
 
-        def tmp_data_list = []
-        non_empty_columns.each { colIndex ->
-            Cell cell = row.getCell(colIndex)
-            def value = ""
-            if (cell == null || cell.getCellType() == CellType.BLANK) {
-                value = ""
-            } else if (cell.getCellType() == CellType.NUMERIC) {
-                if (DateUtil.isCellDateFormatted(cell)) {
-                    Date date = cell.getDateCellValue()
-                    SimpleDateFormat format1 = new SimpleDateFormat("dd-MM-yyyy")
-                    value = format1.format(date)
+        // Обрабатываем строки и записываем их в CSV
+        for (def i = 0; i <= lastRow; i++) {
+            def row = sheet.getRow(i)
+            if (row == null) continue
+            def rowData = []
+            non_empty_columns.each { colIndex ->
+                Cell cell = row.getCell(colIndex)
+                def value = ""
+                if (cell == null || cell.getCellType() == CellType.BLANK) {
+                    value = ""
+                } else if (cell.getCellType() == CellType.NUMERIC) {
+                    if (DateUtil.isCellDateFormatted(cell)) {
+                        Date date = cell.getDateCellValue()
+                        SimpleDateFormat format1 = new SimpleDateFormat("dd-MM-yyyy")
+                        value = format1.format(date)
+                    } else {
+                        double numericValue = cell.getNumericCellValue()
+                        // Проверяем, является ли число целым
+                        if (numericValue == Math.floor(numericValue)) {
+                            value = String.valueOf((int) numericValue) // Преобразуем в целое число
+                        } else {
+                            value = String.valueOf(numericValue) // Оставляем как есть, если число дробное
+                        }
+                    }
+                } else if (cell.getCellType() == CellType.BOOLEAN) {
+                    value = cell.getBooleanCellValue().toString() // Преобразуем boolean в строку
+                } else if (cell.getCellType() == CellType.FORMULA) {
+                    value = cell.getCellFormula()
                 } else {
-                    value = cell.getNumericCellValue()
+                    value = cell.getStringCellValue().replace("\n", "")
                 }
-            } else if (cell.getCellType() == CellType.BOOLEAN) {
-                value = cell.getBooleanCellValue()
-            } else if (cell.getCellType() == CellType.FORMULA) {
-                value = cell.getCellFormula()
-            } else {
-                value = cell.getStringCellValue().replace("\n", "")
+                rowData.add(value)
             }
-            tmp_data_list.add("\"" + value + "\"")
+            csvWriter.writeNext(rowData as String[])
         }
-        csv_data_rows.add(tmp_data_list.join(","))
-    }
+
+        csvWriter.close() // Закрываем CSVWriter
+    } as OutputStreamCallback)
 
     // Закрываем Workbook
     wb.close()
-
-    // Записываем данные в новый FlowFile
-    newFlowFile = session.write(newFlowFile, { outputStream ->
-        outputStream.write(csv_data_rows.join("\n").getBytes(StandardCharsets.UTF_8))
-    } as OutputStreamCallback)
 
     // Удаляем исходный FlowFile
     session.remove(flowFile)
